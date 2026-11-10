@@ -19,6 +19,9 @@ Reports never contain cookies or account details and never overwrite files.
 Exit codes: 0 all VALID; 1 at least one NO_SESSION; 2 CLI/input/dependency/report
 error or ERROR result; 3 UNKNOWN (unless ERROR/NO_SESSION also occurs); 130 Ctrl+C.
 An UNKNOWN result says nothing about cookie validity. The endpoint is internal.
+Worker settings: MAX_WORKERS=4 and WORKERS=2 in .env beside the script/executable.
+Process environment overrides .env; --workers overrides WORKERS, within the
+configured MAX_WORKERS. The supported range remains 1..4.
 """
 
 from __future__ import annotations
@@ -44,6 +47,47 @@ MAX_COOLDOWN = 60.0
 TRANSIENT_CODES = frozenset({5, 6, 7, 16, 18, 28, 52, 55, 56, 92})
 TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 DOMAIN = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\Z")
+
+
+def worker_settings(env_file: Path | None = None, environ=None) -> tuple[int, int]:
+    """Read only worker options; never execute .env or load unrelated secrets."""
+    if env_file is None:
+        base = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+        env_file = base / ".env"
+    environ = os.environ if environ is None else environ
+    values = {}
+    if env_file.exists():
+        with env_file.open("rb") as handle:
+            raw = handle.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("worker configuration unreadable")
+        for line in raw.decode("utf-8-sig").splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, separator, value = line.partition("=")
+            key = key.strip()
+            if key not in ("MAX_WORKERS", "WORKERS"):
+                continue
+            if not separator or key in values:
+                raise ValueError("invalid worker configuration")
+            value = value.split("#", 1)[0].strip()
+            if value.startswith(("'", '"')):
+                if len(value) < 2 or value[-1] != value[0]:
+                    raise ValueError("invalid worker configuration")
+                value = value[1:-1]
+            values[key] = value
+    for key in ("MAX_WORKERS", "WORKERS"):
+        if key in environ:
+            values[key] = environ[key]
+    maximum = values.get("MAX_WORKERS", "4")
+    if maximum not in ("1", "2", "3", "4"):
+        raise ValueError("MAX_WORKERS must be within 1..4")
+    maximum = int(maximum)
+    default = values.get("WORKERS", str(min(2, maximum)))
+    if default not in tuple(str(n) for n in range(1, maximum + 1)):
+        raise ValueError("WORKERS must be within 1..MAX_WORKERS")
+    return int(default), maximum
 
 
 @dataclass(frozen=True)
@@ -336,12 +380,17 @@ def write_report(path: Path, results: list[Result], inputs: list[Path]) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    try:
+        default_workers, max_workers = worker_settings()
+    except (OSError, ValueError):
+        print("ERROR: invalid worker settings; require 1 <= WORKERS <= MAX_WORKERS <= 4")
+        return 2
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--file", type=Path)
     source.add_argument("--directory", type=Path)
     source.add_argument("--self-test", action="store_true")
     source.add_argument("--gui", action="store_true", help="open the Tkinter interface")
-    parser.add_argument("--workers", type=int, choices=range(1, 5), default=2)
+    parser.add_argument("--workers", type=int, choices=range(1, max_workers + 1), default=default_workers)
     parser.add_argument("--timeout", type=float, default=30, help="seconds, >0 and <=120")
     parser.add_argument("--retries", type=int, choices=range(3), default=2)
     parser.add_argument("--report", type=Path, default=Path("valid/results.json"),
@@ -352,7 +401,7 @@ def main(argv=None) -> int:
     if args.self_test:
         return run_tests()
     if args.gui:
-        return run_gui()
+        return run_gui(default_workers=args.workers, max_workers=max_workers)
     try:
         if args.file:
             paths = [args.file]
@@ -468,7 +517,7 @@ def gui_batch(paths, workers, report, gate, events):
         gate.stop.set()
 
 
-def run_gui() -> int:
+def run_gui(*, default_workers: int = 2, max_workers: int = 4) -> int:
     import queue
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -484,7 +533,7 @@ def run_gui() -> int:
     gate = None
     thread = None
     closing = False
-    workers = tk.StringVar(value="2")
+    workers = tk.StringVar(value=str(default_workers))
     selection = tk.StringVar(value="Dosya veya klasör seçin.")
     state = tk.StringVar(value="Hazır")
     report = tk.StringVar(value=str(Path.cwd() / "valid" / "results.json"))
@@ -530,7 +579,7 @@ def run_gui() -> int:
         button.pack(side="left", padx=(0, 8))
         buttons.append(button)
     ttk.Label(controls, text="Worker:").pack(side="left")
-    spinner = ttk.Spinbox(controls, from_=1, to=4, width=3, textvariable=workers, state="readonly")
+    spinner = ttk.Spinbox(controls, from_=1, to=max_workers, width=3, textvariable=workers, state="readonly")
     spinner.pack(side="left", padx=8)
     details = ttk.Frame(root, padding=12)
     details.grid(row=2, column=0, sticky="ew")
@@ -562,7 +611,7 @@ def run_gui() -> int:
         try:
             count = int(workers.get())
             target = Path(report.get())
-            if not paths or not 1 <= count <= 4 or target.exists() or target.is_symlink():
+            if not paths or not 1 <= count <= max_workers or target.exists() or target.is_symlink():
                 raise ValueError
             if any(p.is_symlink() or not p.is_file() or p.resolve() == target.resolve() for p in paths):
                 raise ValueError
@@ -636,6 +685,47 @@ def run_tests() -> int:
 
         def save(self, data):
             self.path.write_text(json.dumps(data), encoding="utf-8")
+
+        def test_worker_settings_defaults_and_file(self):
+            env_file = self.path.parent / ".env"
+            self.assertEqual(worker_settings(env_file, {}), (2, 4))
+            env_file.write_text("MAX_WORKERS=1\n")
+            self.assertEqual(worker_settings(env_file, {}), (1, 1))
+            env_file.write_text("# settings\nexport MAX_WORKERS='3' # limit\nWORKERS=\"2\"\nUNRELATED=ignored\n")
+            self.assertEqual(worker_settings(env_file, {}), (2, 3))
+
+        def test_worker_settings_environment_precedence(self):
+            env_file = self.path.parent / ".env"
+            env_file.write_text("MAX_WORKERS=2\nWORKERS=1\n")
+            self.assertEqual(worker_settings(env_file, {"MAX_WORKERS": "4", "WORKERS": "3"}), (3, 4))
+
+        def test_worker_settings_beside_executable(self):
+            (self.path.parent / ".env").write_text("MAX_WORKERS=3\nWORKERS=1\n")
+            with patch.object(sys, "frozen", True, create=True), \
+                    patch.object(sys, "executable", str(self.path.parent / "app.exe")):
+                self.assertEqual(worker_settings(environ={}), (1, 3))
+
+        def test_worker_settings_reject_invalid(self):
+            env_file = self.path.parent / ".env"
+            for text in ("MAX_WORKERS=100", "MAX_WORKERS=0", "WORKERS=-1",
+                         "MAX_WORKERS=2\nWORKERS=3", "MAX_WORKERS=oops",
+                         "WORKERS=2\nWORKERS=3", "WORKERS='2", "WORKERS=$(echo 2)"):
+                env_file.write_text(text)
+                with self.assertRaises(ValueError):
+                    worker_settings(env_file, {})
+
+        def test_worker_settings_cli_and_gui(self):
+            import contextlib
+            import io
+            with patch(f"{__name__}.worker_settings", return_value=(1, 1)), \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    main(["--file", str(self.path), "--workers", "2"])
+                self.assertEqual(raised.exception.code, 2)
+                with patch(f"{__name__}.run_gui", return_value=0) as gui:
+                    self.assertEqual(main(["--gui"]), 0)
+                    gui.assert_called_once_with(default_workers=1, max_workers=1)
 
         def response(self, data, status=200, content_type="application/json"):
             return Mock(status_code=status, headers={"Content-Type": content_type}, json=Mock(return_value=data))

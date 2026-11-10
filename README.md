@@ -5,6 +5,23 @@ token, e-posta veya ham sunucu yanıtı kaydetmez. Yalnızca `VALID` sonuçları
 adı, durum, kısa neden ve HTTP kodu raporlanır. `UNKNOWN`, geçersiz cookie demek
 değildir. Worker sayısı varsayılan 2, en fazla 4'tür.
 
+## Worker ayarları
+
+`.env.example` dosyasını `check.py` veya `.exe` ile aynı klasöre `.env` adıyla
+kopyalayın. Değişiklikler uygulama yeniden açıldığında okunur:
+
+```dotenv
+MAX_WORKERS=4
+WORKERS=2
+```
+
+`MAX_WORKERS` izin verilen üst sınır, `WORKERS` varsayılan sayıdır.
+`1 <= WORKERS <= MAX_WORKERS <= 4` olmalıdır. Yalnızca `MAX_WORKERS=1` verilirse
+varsayılan sayı da 1 olur. İşlem ortam değişkenleri `.env` değerlerinden önce
+gelir. CLI'daki `--workers`, varsayılanı değiştirir ancak üst sınırı aşamaz.
+Tkinter seçicisi de aynı sınırı kullanır. Başka `.env` anahtarları yüklenmez;
+dosya içeriği komut olarak çalıştırılmaz veya loglanmaz.
+
 ## Windows uygulaması
 
 GitHub'da **Actions → Windows executable** bölümünden başarılı çalışmayı açın.

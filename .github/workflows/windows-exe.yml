@@ -6,10 +6,12 @@ on:
     branches: [main]
     paths:
       - check.py
+      - .env.example
       - .github/workflows/windows-exe.yml
   pull_request:
     paths:
       - check.py
+      - .env.example
       - .github/workflows/windows-exe.yml
 
 permissions:
@@ -48,6 +50,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ChatGPTCookieCheck-windows-x64
-          path: dist/ChatGPTCookieCheck.exe
+          path: |
+            dist/ChatGPTCookieCheck.exe
+            .env.example
           if-no-files-found: error
           retention-days: 14
