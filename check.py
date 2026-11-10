@@ -7,6 +7,7 @@ Examples:
   python check.py --file ./cookies.txt
   python check.py --directory ./cookies --workers 2 --report ./report.json
   python check.py --self-test
+  python check.py --gui
 
 Only immediate *.json and *.txt files in the explicit directory are inspected
 (no recursion or symlink traversal). Supported exports: a cookie array,
@@ -32,6 +33,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -338,6 +340,7 @@ def main(argv=None) -> int:
     source.add_argument("--file", type=Path)
     source.add_argument("--directory", type=Path)
     source.add_argument("--self-test", action="store_true")
+    source.add_argument("--gui", action="store_true", help="open the Tkinter interface")
     parser.add_argument("--workers", type=int, choices=range(1, 5), default=2)
     parser.add_argument("--timeout", type=float, default=30, help="seconds, >0 and <=120")
     parser.add_argument("--retries", type=int, choices=range(3), default=2)
@@ -348,6 +351,8 @@ def main(argv=None) -> int:
         parser.error("timeout must be >0 and <=120")
     if args.self_test:
         return run_tests()
+    if args.gui:
+        return run_gui()
     try:
         if args.file:
             paths = [args.file]
@@ -416,6 +421,204 @@ def main(argv=None) -> int:
             return 2
     states = {r.status for r in results}
     return 2 if "ERROR" in states else 1 if "NO_SESSION" in states else 3 if "UNKNOWN" in states else 0
+
+
+def gui_batch(paths, workers, report, gate, events):
+    """Background coordinator; never call Tk widgets outside the main thread."""
+    results, pending = [], {}
+    remaining = iter(paths)
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            exhausted = False
+            while not gate.stop.is_set() and (pending or not exhausted):
+                while not exhausted and len(pending) < workers:
+                    path = next(remaining, None)
+                    if path is None:
+                        exhausted = True
+                        break
+                    if not gate.ready():
+                        break
+                    pending[pool.submit(check_file, path, gate=gate)] = path
+                if gate.stop.is_set():
+                    break
+                if not pending:
+                    break
+                done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    path = pending.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception:
+                        result = Result(safe_filename(path), "ERROR", "worker failed")
+                    results.append(result)
+                    events.put(("result", result))
+            for future in pending:
+                future.cancel()
+        if gate.stop.is_set():
+            events.put(("done", "Durduruldu; rapor kaydedilmedi."))
+            return
+        write_report(report, sorted(results, key=lambda r: r.filename), paths)
+        valid = sum(r.status == "VALID" for r in results)
+        events.put(("done", f"Tamamlandı: {len(results)} dosya, {valid} VALID. "
+                    + ("Güvenli rapor kaydedildi." if valid else "Rapor oluşturulmadı.")))
+    except Exception:
+        # Never display raw exceptions: they may contain sensitive data.
+        events.put(("done", "İşlem veya rapor kaydı başarısız oldu."))
+    finally:
+        gate.stop.set()
+
+
+def run_gui() -> int:
+    import queue
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    root = tk.Tk()
+    root.title("ChatGPT Oturum Kontrolü")
+    root.geometry("940x560")
+    root.minsize(760, 440)
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(3, weight=1)
+    events = queue.Queue()
+    paths = []
+    gate = None
+    thread = None
+    closing = False
+    workers = tk.StringVar(value="2")
+    selection = tk.StringVar(value="Dosya veya klasör seçin.")
+    state = tk.StringVar(value="Hazır")
+    report = tk.StringVar(value=str(Path.cwd() / "valid" / "results.json"))
+
+    top = ttk.Frame(root, padding=12)
+    top.grid(row=0, column=0, sticky="ew")
+    ttk.Label(top, text="Kendi hesabınıza ait JSON veya Netscape cookie dosyalarını kontrol edin.").pack(anchor="w")
+    ttk.Label(top, text="Cookie ve hesap bilgisi kaydedilmez. Yalnızca VALID sonuç özeti raporlanır.").pack(anchor="w", pady=(4, 0))
+
+    controls = ttk.Frame(root, padding=(12, 0))
+    controls.grid(row=1, column=0, sticky="ew")
+    buttons = []
+
+    def choose_files():
+        chosen = filedialog.askopenfilenames(parent=root, title="Cookie dosyalarını seçin",
+                    filetypes=[("Cookie dosyaları", "*.json *.txt")])
+        if chosen:
+            paths[:] = [Path(p) for p in chosen]
+            selection.set(f"{len(paths)} dosya seçildi.")
+
+    def choose_directory():
+        chosen = filedialog.askdirectory(parent=root, title="Cookie klasörünü seçin")
+        if chosen:
+            try:
+                paths[:] = sorted((p for p in Path(chosen).iterdir() if p.is_file()
+                                   and not p.is_symlink() and p.suffix.lower() in (".json", ".txt")),
+                                  key=lambda p: p.name)
+                selection.set(f"{len(paths)} dosya seçildi; alt klasörler hariç.")
+            except OSError:
+                paths.clear()
+                state.set("Klasör okunamadı.")
+
+    def choose_report():
+        chosen = filedialog.asksaveasfilename(parent=root, title="Yeni rapor dosyası",
+                    defaultextension=".json", initialfile="results.json",
+                    filetypes=[("JSON raporu", "*.json")])
+        if chosen:
+            report.set(chosen)
+
+    for label, command in (("Dosya seç", choose_files), ("Klasör seç", choose_directory),
+                            ("Rapor yolu", choose_report)):
+        button = ttk.Button(controls, text=label, command=command)
+        button.pack(side="left", padx=(0, 8))
+        buttons.append(button)
+    ttk.Label(controls, text="Worker:").pack(side="left")
+    spinner = ttk.Spinbox(controls, from_=1, to=4, width=3, textvariable=workers, state="readonly")
+    spinner.pack(side="left", padx=8)
+    details = ttk.Frame(root, padding=12)
+    details.grid(row=2, column=0, sticky="ew")
+    ttk.Label(details, textvariable=selection).pack(anchor="w")
+    ttk.Label(details, textvariable=report, wraplength=850).pack(anchor="w")
+
+    table_frame = ttk.Frame(root, padding=(12, 0))
+    table_frame.grid(row=3, column=0, sticky="nsew")
+    table_frame.columnconfigure(0, weight=1)
+    table_frame.rowconfigure(0, weight=1)
+    table = ttk.Treeview(table_frame, columns=("filename", "status", "reason", "http"), show="headings")
+    for column, label, width in (("filename", "Dosya", 220), ("status", "Durum", 100),
+                                 ("reason", "Kısa neden", 450), ("http", "HTTP", 65)):
+        table.heading(column, text=label)
+        table.column(column, width=width, stretch=column in ("filename", "reason"))
+    table.grid(row=0, column=0, sticky="nsew")
+    scroll = ttk.Scrollbar(table_frame, orient="vertical", command=table.yview)
+    scroll.grid(row=0, column=1, sticky="ns")
+    table.configure(yscrollcommand=scroll.set)
+
+    def busy(value):
+        for button in buttons + [start_button]:
+            button.configure(state="disabled" if value else "normal")
+        spinner.configure(state="disabled" if value else "readonly")
+        cancel_button.configure(state="normal" if value else "disabled")
+
+    def start():
+        nonlocal gate, thread
+        try:
+            count = int(workers.get())
+            target = Path(report.get())
+            if not paths or not 1 <= count <= 4 or target.exists() or target.is_symlink():
+                raise ValueError
+            if any(p.is_symlink() or not p.is_file() or p.resolve() == target.resolve() for p in paths):
+                raise ValueError
+        except (ValueError, OSError):
+            messagebox.showerror("Başlatılamadı", "Dosya seçin ve henüz mevcut olmayan bir rapor yolu belirleyin.", parent=root)
+            return
+        table.delete(*table.get_children())
+        gate = RateGate()
+        busy(True)
+        state.set("Kontrol ediliyor… 429 yanıtında yeni işler en fazla 60 saniye bekler.")
+        thread = threading.Thread(target=gui_batch, args=(list(paths), count, target, gate, events))
+        thread.start()
+
+    def cancel():
+        if gate is not None:
+            gate.stop.set()
+            state.set("Durduruluyor; devam eden isteklerin bitmesi bekleniyor (en fazla 30 saniye).")
+            cancel_button.configure(state="disabled")
+
+    def close():
+        nonlocal closing
+        if thread is not None and thread.is_alive():
+            closing = True
+            cancel()
+        else:
+            root.destroy()
+
+    footer = ttk.Frame(root, padding=12)
+    footer.grid(row=4, column=0, sticky="ew")
+    start_button = ttk.Button(footer, text="Kontrol et", command=start)
+    start_button.pack(side="left")
+    cancel_button = ttk.Button(footer, text="Durdur", command=cancel, state="disabled")
+    cancel_button.pack(side="left", padx=8)
+    ttk.Label(footer, textvariable=state, wraplength=650).pack(side="left", padx=8)
+
+    def poll():
+        while True:
+            try:
+                kind, data = events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "result":
+                table.insert("", "end", values=(data.filename, data.status, data.reason,
+                                                data.http_status if data.http_status is not None else "—"))
+            elif kind == "done":
+                state.set(data)
+                busy(False)
+        if closing and thread is not None and not thread.is_alive():
+            root.destroy()
+            return
+        root.after(100, poll)
+
+    root.protocol("WM_DELETE_WINDOW", close)
+    root.after(100, poll)
+    root.mainloop()
+    return 0
 
 
 def run_tests() -> int:
@@ -689,13 +892,47 @@ def run_tests() -> int:
                 self.assertEqual(main(["--file", str(self.path), "--workers", "1"]), 3)
             self.assertEqual(ready.call_count, 1)
 
-    outcome = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
+        def test_gui_batch_report_and_events(self):
+            import queue
+            events = queue.Queue()
+            report = self.path.parent / "valid" / "results.json"
+            outcomes = [Result("own.json", "VALID", "test", 200),
+                        Result("other.txt", "UNKNOWN", "rate limited", 429)]
+            with patch(f"{__name__}.check_file", side_effect=outcomes):
+                gui_batch([self.path, self.path.parent / "other.txt"], 1, report, RateGate(), events)
+            messages = []
+            while not events.empty():
+                messages.append(events.get_nowait())
+            self.assertEqual([kind for kind, _ in messages], ["result", "result", "done"])
+            self.assertEqual(json.loads(report.read_text()), [asdict(outcomes[0])])
+
+        def test_gui_batch_cancel_and_failure_privacy(self):
+            import queue
+            events = queue.Queue()
+            report = self.path.parent / "valid" / "results.json"
+            gate = RateGate()
+            gate.stop.set()
+            with patch(f"{__name__}.check_file") as check:
+                gui_batch([self.path], 2, report, gate, events)
+                check.assert_not_called()
+            self.assertFalse(report.exists())
+            self.assertEqual(events.get_nowait()[0], "done")
+            with patch(f"{__name__}.check_file", return_value=Result("own.json", "VALID", "test", 200)), \
+                    patch(f"{__name__}.write_report", side_effect=OSError("private-value")):
+                gui_batch([self.path], 2, report, RateGate(), events)
+            while not events.empty():
+                self.assertNotIn("private-value", str(events.get_nowait()))
+
+    import io
+    outcome = unittest.TextTestRunner(stream=sys.stderr or io.StringIO(), verbosity=2).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
     return 0 if outcome.wasSuccessful() else 2
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        # A windowed executable opens the GUI on double-click; flags retain CLI use.
+        raise SystemExit(main(["--gui"] if getattr(sys, "frozen", False) and len(sys.argv) == 1 else None))
     except KeyboardInterrupt:
         print("Interrupted.")
         raise SystemExit(130)

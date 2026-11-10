@@ -1,0 +1,53 @@
+name: Windows executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - check.py
+      - .github/workflows/windows-exe.yml
+  pull_request:
+    paths:
+      - check.py
+      - .github/workflows/windows-exe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install "curl_cffi==0.17.0" "pyinstaller>=6.11,<7"
+      - name: Run offline tests
+        run: python check.py --self-test
+      - name: Build GUI executable
+        run: >-
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name ChatGPTCookieCheck --collect-all curl_cffi --collect-all certifi
+          --hidden-import tkinter --hidden-import tkinter.ttk
+          --hidden-import tkinter.filedialog --hidden-import tkinter.messagebox
+          check.py
+      - name: Test packaged executable
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath ./dist/ChatGPTCookieCheck.exe -ArgumentList '--self-test' -PassThru
+          if (-not $process.WaitForExit(120000)) {
+            $process.Kill()
+            throw 'Packaged tests timed out'
+          }
+          if ($process.ExitCode -ne 0) { throw "Packaged tests failed: $($process.ExitCode)" }
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatGPTCookieCheck-windows-x64
+          path: dist/ChatGPTCookieCheck.exe
+          if-no-files-found: error
+          retention-days: 14
