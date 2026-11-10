@@ -4,11 +4,14 @@
 Python >=3.10; install: python -m pip install 'curl_cffi==0.17.0'
 Examples:
   python check.py --file ./cookies.json
+  python check.py --file ./cookies.txt
   python check.py --directory ./cookies --workers 2 --report ./report.json
   python check.py --self-test
 
-Only immediate *.json files in the explicit directory are inspected (no recursion
-or symlink traversal). Supported exports: a cookie array or {"cookies": [...]}.
+Only immediate *.json and *.txt files in the explicit directory are inspected
+(no recursion or symlink traversal). Supported exports: a cookie array,
+{"cookies": [...]}, or a tab-separated Netscape cookie file. Format is detected
+from content; Netscape files are read directly without creating converted files.
 Only VALID result metadata is saved to valid/results.json by default. --report
 selects another destination. No report is created when there are no VALID results.
 Reports never contain cookies or account details and never overwrite files.
@@ -103,6 +106,45 @@ def _unique_object(pairs):
     return obj
 
 
+def parse_netscape(text: str) -> list[dict]:
+    """Parse seven-column exports, including HttpOnly comment-prefixed cookies."""
+    cookies = []
+    header_seen = False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            if line.strip() in ("# Netscape HTTP Cookie File", "# HTTP Cookie File"):
+                header_seen = True
+            continue
+        columns = line.split("\t")
+        if len(columns) != 7:
+            raise ValueError("invalid Netscape cookie row")
+        domain, subdomains, path, secure, expiration, name, value = columns
+        if subdomains not in ("TRUE", "FALSE") or secure not in ("TRUE", "FALSE"):
+            raise ValueError("invalid Netscape cookie flag")
+        if (subdomains == "TRUE") != domain.startswith("."):
+            raise ValueError("conflicting Netscape domain scope")
+        if expiration == "":
+            expiry = -1
+        elif len(expiration) <= 20 and re.fullmatch(r"-?[0-9]+", expiration):
+            expiry = int(expiration)
+            # Netscape uses zero (or an empty column) for session cookies.
+            if expiry == 0:
+                expiry = -1
+        else:
+            raise ValueError("invalid Netscape expiration")
+        cookies.append({"domain": domain, "path": path, "name": name,
+                        "value": value, "expires": expiry})
+        if len(cookies) > 3000:
+            raise ValueError("too many cookies")
+    if not cookies and not header_seen:
+        raise ValueError("unrecognized cookie file")
+    return cookies
+
+
 def load_cookies(path: Path, now: float | None = None) -> list[dict]:
     """Validate the entire export before sending any nonexpired target cookies."""
     now = time.time() if now is None else now
@@ -112,7 +154,11 @@ def load_cookies(path: Path, now: float | None = None) -> list[dict]:
         raw = handle.read(MAX_FILE_BYTES + 1)
     if len(raw) > MAX_FILE_BYTES:
         raise ValueError("cookie file too large")
-    data = json.loads(raw, object_pairs_hook=_unique_object)
+    text = raw.decode("utf-8-sig")
+    if text.lstrip().startswith(("[", "{")):
+        data = json.loads(text, object_pairs_hook=_unique_object)
+    else:
+        data = parse_netscape(text)
     if isinstance(data, dict):
         data = data.get("cookies")
     if not isinstance(data, list) or len(data) > 3000:
@@ -305,13 +351,13 @@ def main(argv=None) -> int:
     try:
         if args.file:
             paths = [args.file]
-            if args.file.suffix.lower() != ".json" or not args.file.is_file() or args.file.is_symlink():
+            if args.file.suffix.lower() not in (".json", ".txt") or not args.file.is_file() or args.file.is_symlink():
                 raise ValueError
         else:
             if args.directory.is_symlink() or not args.directory.is_dir():
                 raise ValueError
             paths = sorted((p for p in args.directory.iterdir()
-                            if p.suffix.lower() == ".json" and p.is_file() and not p.is_symlink()),
+                            if p.suffix.lower() in (".json", ".txt") and p.is_file() and not p.is_symlink()),
                            key=lambda p: p.name)
             if not paths:
                 raise ValueError
@@ -407,6 +453,46 @@ def run_tests() -> int:
                     self.save([dict(self.cookie, **change)])
                     with self.assertRaises(ValueError):
                         load_cookies(self.path)
+
+        def test_netscape_exports(self):
+            self.path = self.path.with_suffix(".txt")
+            self.path.write_text("\ufeff# Netscape HTTP Cookie File\n# comment\n"
+                                 "#HttpOnly_.chatgpt.com\tTRUE\t/\tTRUE\t0\tsession\tprivate-value\n"
+                                 "chatgpt.com\tFALSE\t/\tFALSE\t1\told\texpired\n"
+                                 "chatgpt.com\tFALSE\t/\tTRUE\t\tblank-expiry\tvalue\n"
+                                 ".example.com\tTRUE\t/\tFALSE\t0\tother\tvalue\n")
+            cookies = load_cookies(self.path)
+            self.assertEqual([c["name"] for c in cookies], ["session", "blank-expiry"])
+            self.assertEqual(cookies[0]["domain"], ".chatgpt.com")
+            self.assertEqual(cookies[0]["_expires"], -1)
+
+        def test_netscape_invalid_rows(self):
+            for line in ("garbage", ".chatgpt.com\tTRUE\t/\tTRUE\t0\tmissing-value",
+                         ".chatgpt.com\tMAYBE\t/\tTRUE\t0\tname\tvalue",
+                         ".chatgpt.com\tFALSE\t/\tTRUE\t0\tname\tvalue",
+                         ".chatgpt.com\tTRUE\t/\tTRUE\tNaN\tname\tvalue",
+                         ".chatgpt.com\tTRUE\t/\tTRUE\t-2\tname\tvalue",
+                         ".chatgpt.com\tTRUE\trelative\tTRUE\t0\tname\tvalue"):
+                self.path.write_text(line)
+                with self.assertRaises(ValueError):
+                    load_cookies(self.path)
+
+        def test_cli_netscape_and_mixed_directory(self):
+            import contextlib
+            import io
+            text_file = self.path.parent / "session.txt"
+            text_file.write_text("chatgpt.com\tFALSE\t/\tTRUE\t1\told\tvalue\n")
+            report = self.path.parent / "valid" / "results.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["--file", str(text_file), "--report", str(report)]), 1)
+            self.assertFalse(report.exists())
+            # Keep the mixed-directory test fully offline.
+            self.save([])
+            with patch(f"{__name__}.check_file", return_value=Result("fixture", "NO_SESSION", "test")) as check, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["--directory", str(self.path.parent), "--report", str(report)]), 1)
+            self.assertEqual({call.args[0].suffix for call in check.call_args_list}, {".txt", ".json"})
+            self.assertEqual(check.call_count, 2)
 
         def test_invalid_json_and_duplicates(self):
             for raw in ('{"cookies":[],"cookies":[]}', 'null', '{'):
