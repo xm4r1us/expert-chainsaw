@@ -9,6 +9,9 @@ Examples:
 
 Only immediate *.json files in the explicit directory are inspected (no recursion
 or symlink traversal). Supported exports: a cookie array or {"cookies": [...]}.
+Only VALID result metadata is saved to valid/results.json by default. --report
+selects another destination. No report is created when there are no VALID results.
+Reports never contain cookies or account details and never overwrite files.
 Exit codes: 0 all VALID; 1 at least one NO_SESSION; 2 CLI/input/dependency/report
 error or ERROR result; 3 UNKNOWN (unless ERROR/NO_SESSION also occurs); 130 Ctrl+C.
 An UNKNOWN result says nothing about cookie validity. The endpoint is internal.
@@ -264,9 +267,13 @@ def check_file(path: str | Path, *, gate: RateGate | None = None,
 
 
 def write_report(path: Path, results: list[Result], inputs: list[Path]) -> None:
-    """Atomic private report; refuse overwriting an input or an existing file."""
+    """Save VALID metadata only; never copy cookies or overwrite existing files."""
+    results = [result for result in results if result.status == "VALID"]
+    if not results:
+        return
     if path.resolve() in {item.resolve() for item in inputs} or path.exists() or path.is_symlink():
         raise ValueError("report destination already exists or is an input")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".check-report-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -288,7 +295,8 @@ def main(argv=None) -> int:
     parser.add_argument("--workers", type=int, choices=range(1, 5), default=2)
     parser.add_argument("--timeout", type=float, default=30, help="seconds, >0 and <=120")
     parser.add_argument("--retries", type=int, choices=range(3), default=2)
-    parser.add_argument("--report", type=Path, help="new JSON report file; never overwritten")
+    parser.add_argument("--report", type=Path, default=Path("valid/results.json"),
+                        help="VALID metadata only (default: valid/results.json); never overwritten")
     args = parser.parse_args(argv)
     if not 0 < args.timeout <= 120:
         parser.error("timeout must be >0 and <=120")
@@ -308,7 +316,6 @@ def main(argv=None) -> int:
             if not paths:
                 raise ValueError
         if args.report and (args.report.exists() or args.report.is_symlink()
-                            or not args.report.parent.is_dir()
                             or args.report.resolve() in {p.resolve() for p in paths}):
             raise ValueError
     except (OSError, ValueError):
@@ -466,6 +473,20 @@ def run_tests() -> int:
             self.assertEqual(set(json.loads(text)[0]), {"filename", "status", "reason", "http_status"})
             with self.assertRaises(ValueError):
                 write_report(self.path, [result], [self.path])
+
+        def test_report_saves_only_valid_metadata(self):
+            report = self.path.parent / "valid" / "results.json"
+            rejected = [Result("no.json", "NO_SESSION", "empty session object"),
+                        Result("unknown.json", "UNKNOWN", "rate limited", 429),
+                        Result("error.json", "ERROR", "request failed")]
+            write_report(report, rejected, [self.path])
+            self.assertFalse(report.parent.exists())
+            valid = Result("ok.json", "VALID", "authenticated session structure confirmed", 200)
+            write_report(report, rejected + [valid], [self.path])
+            self.assertEqual(json.loads(report.read_text()), [asdict(valid)])
+            self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(ValueError):
+                write_report(report, [valid], [self.path])
 
         def test_expired_cookies_never_make_requests(self):
             self.save([dict(self.cookie, expires=0)])
